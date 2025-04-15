@@ -777,29 +777,25 @@ class MarginLoanManager:
                 time.sleep(1.2 * (attempt + 1))
         raise Exception("Préstamo fallido tras varios intentos.")
     print(f"⏱️ verificando prestamo {datetime.now().strftime('%H:%M:%S.%f')}")
-    def _verify_loan(self, asset, amount, timeout=5):
-        print(f"⏱️ Verificando préstamo para {asset}...")
+    
+    def _verify_loan(self, asset, amount, timeout=10):  # Increase timeout
         start_time = time.time()
         min_expect = Decimal(amount) * Decimal('0.95')
-
+        
         while time.time() - start_time < timeout:
             margin_info = self.client.get_margin_account()
             balances = {b['asset']: b for b in margin_info['userAssets']}
             borrowed = Decimal(balances.get(asset, {}).get('borrowed', '0'))
             free = Decimal(balances.get(asset, {}).get('free', '0'))
 
-            print(f"   🔍 borrowed: {borrowed}, free: {free} / esperando al menos: {min_expect}")
-
+            # Accept if the loan has been successfully borrowed, even if not yet available as free
             if borrowed >= min_expect:
-                print(f"🔄 Préstamo registrado: {borrowed} {asset}")
-
-            if free >= min_expect:
-                print(f"✅ Préstamo disponible para operar: {free} {asset}")
+                print(f"✅ Loan secured (borrowed): {borrowed} {asset}")
                 return True
-
-            time.sleep(0.2)
-
-        print("❌ Timeout esperando disponibilidad del préstamo.")
+                
+            time.sleep(0.5)
+        
+        print("❌ Timeout: Loan not reflected in account.")
         return False
 
 
@@ -819,31 +815,35 @@ class ArbitrageExecutor:
     def execute_trio(self, par1, par2, par3, base_amount, alt_amount):
         print(f"⏱️ Ejecutando arbitraje a las {datetime.now().strftime('%H:%M:%S.%f')}")
         try:
-            # 1. Préstamo anticipado para par2
-            self.loan_manager.request_loan(par2, base_amount)
-            time.sleep(0.15)  # Esperar un poco para asegurar que el préstamo se registre
-            # 2. Ejecutar las órdenes
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future_short_buy = executor.submit(self._short_buy, par2, alt_amount)
-                time.sleep(0.3)  # Darle prioridad a la orden más volátil
+            # Check real-time prices before execution
+            if not self._validate_prices(par1, par2, par3):
+                raise ValueError("Prices have changed unfavorably.")
+            
+            # Prioritize order sequence: Buy par1 FIRST, then short par2 and sell par3
+            t1 = threading.Thread(target=self._normal_buy, args=(par1, base_amount))
+            t1.start()
+            t1.join()  # Wait for the buy order to complete
 
-                future_normal_buy = executor.submit(self._normal_buy, par1, base_amount)
-                future_short_sell = executor.submit(self._short_sell, par3, alt_amount)
-
-                results = {
-                    'short_buy': future_short_buy.result(),
-                    'normal_buy': future_normal_buy.result(),
-                    'short_sell': future_short_sell.result()
-                }
-
-            print("✅ Todas las órdenes han sido ejecutadas.")
-            return results
+            t2 = threading.Thread(target=self._short_buy, args=(par2, alt_amount))
+            t3 = threading.Thread(target=self._short_sell, args=(par3, alt_amount))
+            t2.start(); t3.start()
+            t2.join(); t3.join()
 
         except Exception as e:
             print(f"❌ Error durante la ejecución del arbitraje: {e}")
             self._emergency_cleanup()
             raise
 
+    def _validate_prices(self, par1, par2, par3):
+        # Get the latest prices from WebSocket/API
+        price1 = Decimal(self.client.get_symbol_ticker(symbol=par1)['price'])
+        price2 = Decimal(self.client.get_symbol_ticker(symbol=par2)['price'])
+        price3 = Decimal(self.client.get_symbol_ticker(symbol=par3)['price'])
+        
+        # Recalculate the potential profit
+        final_usdt = (cantidad_usdt / price1 * price3 / price2) * (1 - comision)**3
+        return (final_usdt / cantidad_usdt) >= Decimal('1.005')  # Only proceed if profit is >= 0.5%        
+    
     def _normal_buy(self, symbol, quantity):
         print(f"🔹 Ejecutando COMPRA normal ({symbol})")
         return self.client.create_margin_order(
